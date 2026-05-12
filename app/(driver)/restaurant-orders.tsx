@@ -4,28 +4,29 @@
 
 import { db } from "@/config/firebase";
 import { useAuth } from "@/contexts/AuthContext";
+import DeliveryTicketModal, { TicketOrder } from "@/components/DeliveryTicketModal";
 import { Ionicons } from "@expo/vector-icons";
 import { router } from "expo-router";
 import {
-    collection,
-    doc,
-    onSnapshot,
-    orderBy,
-    query,
-    serverTimestamp,
-    where,
-    writeBatch
+  collection,
+  doc,
+  onSnapshot,
+  orderBy,
+  query,
+  serverTimestamp,
+  where,
+  writeBatch,
 } from "firebase/firestore";
 import React, { useEffect, useState } from "react";
 import {
-    Alert,
-    Linking,
-    Modal,
-    ScrollView,
-    StyleSheet,
-    Text,
-    TouchableOpacity,
-    View,
+  Alert,
+  Linking,
+  Modal,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
@@ -85,12 +86,14 @@ export default function DriverRestaurantOrders() {
   const [history, setHistory] = useState<Order[]>([]);
   const [selected, setSelected] = useState<Order | null>(null);
   const [loading, setLoading] = useState(false);
+  const [ticketOrder, setTicketOrder] = useState<TicketOrder | null>(null);
+  const [ticketVisible, setTicketVisible] = useState(false);
 
   // ── Pedidos disponibles (accepted, sin driver) ─────────────────────────────
   useEffect(() => {
     const unsub = onSnapshot(
       query(
-        collection(db, "restaurant_orders"),
+        collection(db, "eats_orders"),
         where("status", "==", "accepted"),
         where("driverUid", "==", null),
         orderBy("createdAt", "asc"),
@@ -106,7 +109,7 @@ export default function DriverRestaurantOrders() {
     if (!user) return;
     const unsub = onSnapshot(
       query(
-        collection(db, "restaurant_orders"),
+        collection(db, "eats_orders"),
         where("status", "==", "delivering"),
         where("driverUid", "==", user.uid),
         orderBy("createdAt", "desc"),
@@ -122,7 +125,7 @@ export default function DriverRestaurantOrders() {
     if (!user) return;
     const unsub = onSnapshot(
       query(
-        collection(db, "restaurant_orders"),
+        collection(db, "eats_orders"),
         where("status", "==", "delivered"),
         where("driverUid", "==", user.uid),
         orderBy("createdAt", "desc"),
@@ -139,7 +142,7 @@ export default function DriverRestaurantOrders() {
     setLoading(true);
     const batch = writeBatch(db);
 
-    batch.update(doc(db, "restaurant_orders", order.id), {
+    batch.update(doc(db, "eats_orders", order.id), {
       status: "delivering",
       driverUid: user.uid,
       driverName: user.displayName ?? "Driver",
@@ -176,8 +179,9 @@ export default function DriverRestaurantOrders() {
             setLoading(true);
             const batch = writeBatch(db);
 
-            batch.update(doc(db, "restaurant_orders", order.id), {
+            batch.update(doc(db, "eats_orders", order.id), {
               status: "delivered",
+              deliveredAt: serverTimestamp(),
               updatedAt: serverTimestamp(),
             });
 
@@ -195,6 +199,25 @@ export default function DriverRestaurantOrders() {
             await batch.commit();
             setLoading(false);
             setSelected(null);
+
+            // Mostrar ticket
+            setTicketOrder({
+              id: order.id,
+              module: "eats",
+              restaurantName: order.restaurantName,
+              userName: order.userName,
+              userPhone: order.userPhone,
+              address: order.userAddress,
+              items: order.items.map((i) => ({ name: i.name, qty: i.qty, price: i.price })),
+              subtotal: order.subtotal,
+              deliveryFee: order.deliveryFee,
+              total: order.total,
+              paymentMethod: "cash",
+              driverName: user?.displayName ?? "Driver",
+              deliveredAt: new Date(),
+              createdAt: order.createdAt,
+            });
+            setTicketVisible(true);
           },
         },
       ],
@@ -342,6 +365,13 @@ export default function DriverRestaurantOrders() {
         )}
         <View style={{ height: 40 }} />
       </ScrollView>
+
+      {/* Delivery ticket */}
+      <DeliveryTicketModal
+        visible={ticketVisible}
+        order={ticketOrder}
+        onClose={() => { setTicketVisible(false); setTicketOrder(null); }}
+      />
 
       {/* ── DETAIL MODAL ─────────────────────────────────────────────────────── */}
       {selected &&

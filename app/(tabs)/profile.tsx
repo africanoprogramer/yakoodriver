@@ -1,8 +1,7 @@
-import { auth, db } from "@/config/firebase";
+import { db } from "@/config/firebase";
 import { useAuth } from "@/contexts/AuthContext";
 import { Ionicons } from "@expo/vector-icons";
 import { router } from "expo-router";
-import { signOut } from "firebase/auth";
 import { doc, onSnapshot, updateDoc } from "firebase/firestore";
 import React, { useEffect, useState } from "react";
 import {
@@ -41,7 +40,7 @@ interface DriverProfile {
 }
 
 export default function ProfileScreen() {
-  const { user } = useAuth();
+  const { user, signOut: authSignOut } = useAuth();
   const [profile, setProfile] = useState<DriverProfile | null>(null);
   const [loading, setLoading] = useState(true);
   const [togglingOnline, setTogglingOnline] = useState(false);
@@ -85,7 +84,7 @@ export default function ProfileScreen() {
         style: "destructive",
         onPress: async () => {
           try {
-            await signOut(auth);
+            await authSignOut();
             router.replace("/(auth)/login");
           } catch (error) {
             console.error("Error cerrando sesión:", error);
@@ -117,10 +116,7 @@ export default function ProfileScreen() {
     );
   }
 
-  const acceptanceRate =
-    profile.totalTrips > 0
-      ? Math.round((profile.totalTrips / (profile.totalTrips + 1)) * 100)
-      : 100;
+  const acceptanceRate = (profile as any).acceptanceRate ?? 100;
 
   return (
     <SafeAreaView style={styles.container} edges={["top"]}>

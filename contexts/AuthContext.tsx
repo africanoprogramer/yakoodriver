@@ -65,6 +65,14 @@ export interface DriverData {
   documents?: Documents;
   verificationStatus: VerificationStatus;
   createdAt?: any;
+
+  // ── Viaje/Reserva actual ────────────────────────────
+  /** ID del viaje de Uber/ride en curso (null si no hay) */
+  currentRideId?: string | null;
+  /** ID de la reserva de empresa en curso (null si no hay) */
+  currentBookingId?: string | null;
+  /** Fecha de actualización */
+  updatedAt?: any;
 }
 
 interface AuthContextType {
@@ -73,9 +81,10 @@ interface AuthContextType {
   loading: boolean;
   isAuthenticated: boolean;
   isDriverVerified: boolean;
-  isMotoDriver: boolean; // ← nuevo: true si el vehículo es moto
+  isMotoDriver: boolean;
+  hasActiveTrip: boolean; // ← true si tiene un ride o booking en curso
   signOut: () => Promise<void>;
-  refreshDriver: () => void; // ← fuerza re-suscripción (útil tras editar perfil)
+  refreshDriver: () => void;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -89,7 +98,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [isDriverVerified, setIsDriverVerified] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
 
-  // Ref para poder cancelar el listener de Firestore cuando cambie el usuario
   const driverUnsubRef = useRef<(() => void) | null>(null);
 
   const isFullyVerified = (d: DriverData) =>
@@ -99,9 +107,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     d.verificationStatus?.vehicle === "verified";
 
   useEffect(() => {
-    // ── 1. Escuchar cambios de autenticación ──
     const authUnsub = onAuthStateChanged(auth, (currentUser) => {
-      // Cancelar listener anterior de Firestore si existe
       if (driverUnsubRef.current) {
         driverUnsubRef.current();
         driverUnsubRef.current = null;
@@ -118,7 +124,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setUser(currentUser);
       console.log("🚗 Conductor autenticado:", currentUser.uid);
 
-      // ── 2. Suscripción en tiempo real al documento del conductor ──
       const driverRef = doc(db, "drivers", currentUser.uid);
 
       driverUnsubRef.current = onSnapshot(
@@ -134,6 +139,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
               isVerified: data.isVerified,
               vehicleType: data.vehicle?.type ?? "—",
               status: data.status,
+              currentRide: data.currentRideId ?? "ninguno",
+              currentBooking: data.currentBookingId ?? "ninguna",
             });
           } else {
             console.warn(
@@ -158,7 +165,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       authUnsub();
       if (driverUnsubRef.current) driverUnsubRef.current();
     };
-  }, [refreshKey]); // refreshKey permite forzar una nueva suscripción
+  }, [refreshKey]);
 
   const signOut = async () => {
     try {
@@ -186,6 +193,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     isAuthenticated: !!user,
     isDriverVerified,
     isMotoDriver: driverData?.vehicle?.type === "moto",
+    hasActiveTrip: !!(
+      driverData?.currentRideId || driverData?.currentBookingId
+    ),
     signOut,
     refreshDriver,
   };
@@ -214,6 +224,11 @@ export function useDriverData() {
 /** True si el vehículo del conductor es moto */
 export function useIsMotoDriver() {
   return useAuth().isMotoDriver;
+}
+
+/** True si tiene un viaje o reserva activa */
+export function useHasActiveTrip() {
+  return useAuth().hasActiveTrip;
 }
 
 /** uid + email + todos los campos del conductor */

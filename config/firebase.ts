@@ -2,7 +2,9 @@ import ReactNativeAsyncStorage from "@react-native-async-storage/async-storage";
 import { initializeApp } from "firebase/app";
 import { getReactNativePersistence, initializeAuth } from "firebase/auth";
 import { getFirestore } from "firebase/firestore";
+import { getFunctions } from "firebase/functions";
 import { getStorage } from "firebase/storage";
+
 // Configuración de Firebase - YAKOO
 // Para obtener estas credenciales:
 // 1. Ve a https://console.firebase.google.com/
@@ -33,5 +35,6 @@ const auth = initializeAuth(app, {
 export { auth };
 export const db = getFirestore(app);
 export const storage = getStorage(app);
+export const functions = getFunctions(app, "europe-west1");
 
 export default app;

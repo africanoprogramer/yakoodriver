@@ -1,15 +1,11 @@
 /**
  * rideNotificationsListener.ts
  *
- * Escucha notificaciones de viajes en tiempo real para YakooDriver.
- *
- * FLUJO:
- * 1. Query: notificationStatus == "pending"
- * 2. Cuando el pasajero cancela/expira, el cliente actualiza
- *    notificationStatus a "expired" en drivers/{driverId}/rideNotifications/{rideId}
- * 3. Firestore onSnapshot detecta que el doc ya NO cumple el query (pending),
- *    así que dispara change.type === "removed"
- * 4. Llamamos onNotificationRemoved para cerrar el modal
+ * FIXES:
+ * 1. Ignora notificaciones viejas al conectar — solo muestra las NUEVAS
+ *    que llegan después de que el listener empezó.
+ * 2. runTransaction en acceptRideNotification para que solo 1 conductor acepte.
+ * 3. markDriverAction para evitar falso "Solicitud cancelada" al aceptar.
  */
 
 import { db } from "@/config/firebase";
@@ -18,6 +14,7 @@ import {
   doc,
   onSnapshot,
   query,
+  runTransaction,
   serverTimestamp,
   updateDoc,
   where,
@@ -33,25 +30,24 @@ interface RideNotification {
   vehicleType: string;
   distance: number;
   estimatedPrice: number;
-  notificationStatus: "pending" | "accepted" | "rejected" | "expired";
+  notificationStatus?: "pending" | "accepted" | "rejected" | "expired";
   createdAt: any;
 }
 
-/**
- * Escuchar notificaciones pendientes de viajes.
- *
- * @param onNewNotification — se llama cuando llega una NUEVA solicitud (mostrar modal)
- * @param onNotificationRemoved — se llama cuando una solicitud DESAPARECE del query
- *        (porque cambió de "pending" a "expired"/"cancelled" → cerrar modal)
- */
 export const listenToRideNotifications = (
   driverId: string,
   onNewNotification: (notification: RideNotification) => void,
   onNotificationsChange?: (notifications: RideNotification[]) => void,
   onNotificationRemoved?: (rideId: string) => void,
 ) => {
+  const activeRideIds = new Set<string>();
+  const driverActionRideIds = new Set<string>();
+
+  // ── CLAVE: Flag para ignorar el primer snapshot (que trae docs viejos) ──
+  let isInitialSnapshot = true;
+
   try {
-    console.log("👂 Escuchando notificaciones pendientes...");
+    console.log("👂 Escuchando notificaciones pendientes para:", driverId);
 
     const notificationsRef = collection(
       db,
@@ -67,52 +63,82 @@ export const listenToRideNotifications = (
     const unsubscribe = onSnapshot(
       q,
       (snapshot) => {
-        const allPending: RideNotification[] = [];
+        const added: (RideNotification & { id: string })[] = [];
+        const removed: string[] = [];
 
         snapshot.docChanges().forEach((change) => {
           const data = {
             id: change.doc.id,
             ...change.doc.data(),
           } as RideNotification & { id: string };
+          if (change.type === "added") added.push(data);
+          else if (change.type === "removed")
+            removed.push(data.rideId || data.id);
+        });
 
-          if (change.type === "added") {
-            console.log("📢 NUEVA solicitud:", data.rideId);
-            onNewNotification(data as RideNotification);
+        // ── PRIMER SNAPSHOT: son docs que ya existían, NO mostrar modal ──
+        if (isInitialSnapshot) {
+          isInitialSnapshot = false;
+          const oldCount = added.length;
+          if (oldCount > 0) {
+            console.log(
+              `⏭️ Ignorando ${oldCount} notificaciones viejas al conectar`,
+            );
+            // Solo registrar como activas (para poder detectar cuando se remuevan)
+            added.forEach((n) => activeRideIds.add(n.rideId));
           }
+          return; // No llamar onNewNotification
+        }
 
-          if (change.type === "removed") {
-            // El doc ya no cumple notificationStatus == "pending"
-            // → fue expirado/cancelado/aceptado/rechazado
-            console.log("🚫 Solicitud REMOVIDA del query:", data.rideId);
-            if (onNotificationRemoved) {
-              onNotificationRemoved(data.rideId);
+        // ── SNAPSHOTS SIGUIENTES: son cambios reales ──
+        const trueAdded = added.filter((n) => !removed.includes(n.rideId));
+
+        // Nuevas notificaciones REALES (llegaron después de conectar)
+        trueAdded.forEach((notification) => {
+          if (!activeRideIds.has(notification.rideId)) {
+            console.log("📢 NUEVA solicitud (real):", notification.rideId);
+            activeRideIds.add(notification.rideId);
+            onNewNotification(notification as RideNotification);
+          }
+        });
+
+        // Removidas
+        removed.forEach((rideId) => {
+          if (activeRideIds.has(rideId)) {
+            activeRideIds.delete(rideId);
+            if (driverActionRideIds.has(rideId)) {
+              console.log("✅ Removido por acción del conductor:", rideId);
+              driverActionRideIds.delete(rideId);
+            } else {
+              console.log("🚫 Removido por pasajero:", rideId);
+              setTimeout(() => {
+                if (onNotificationRemoved) onNotificationRemoved(rideId);
+              }, 500);
             }
           }
         });
 
-        // Todos los docs pendientes actuales
-        snapshot.docs.forEach((d) => {
-          allPending.push({ id: d.id, ...d.data() } as any);
-        });
-
         if (onNotificationsChange) {
-          onNotificationsChange(allPending);
+          onNotificationsChange(
+            snapshot.docs.map((d) => ({ id: d.id, ...d.data() })) as any[],
+          );
         }
       },
-      (error) => {
-        console.error("❌ Error escuchando notificaciones:", error);
-      },
+      (error) => console.error("❌ Error listener:", error),
     );
 
-    return unsubscribe;
+    const markDriverAction = (rideId: string) => {
+      driverActionRideIds.add(rideId);
+    };
+    return { unsubscribe, markDriverAction };
   } catch (error) {
     console.error("❌ Error en listenToRideNotifications:", error);
-    return () => {};
+    return { unsubscribe: () => {}, markDriverAction: (_: string) => {} };
   }
 };
 
 /**
- * Aceptar viaje
+ * Aceptar viaje — transacción atómica (solo 1 conductor puede aceptar)
  */
 export const acceptRideNotification = async (
   driverId: string,
@@ -120,28 +146,55 @@ export const acceptRideNotification = async (
   driverData: any,
 ): Promise<{ success: boolean; error?: string }> => {
   try {
-    console.log("✅ Aceptando viaje:", rideId);
+    console.log("✅ Intentando aceptar viaje:", rideId);
+    const rideRef = doc(db, "rides", rideId);
 
-    // 1. Marcar notificación como aceptada
+    await runTransaction(db, async (transaction) => {
+      const rideSnap = await transaction.get(rideRef);
+      if (!rideSnap.exists()) throw new Error("El viaje ya no existe");
+
+      const rideData = rideSnap.data();
+
+      // Ya aceptado por ESTE conductor — no es error, simplemente no hacer nada
+      if (rideData.status === "accepted" && rideData.acceptedBy === driverId) {
+        console.log("ℹ️ Ya aceptado por ti, ignorando duplicado");
+        return; // No actualizar, no lanzar error
+      }
+
+      // Aceptado por OTRO conductor
+      if (rideData.status === "accepted" && rideData.acceptedBy) {
+        throw new Error("Otro conductor ya aceptó este viaje");
+      }
+
+      if (rideData.status === "cancelled" || rideData.status === "expired") {
+        throw new Error("El viaje fue cancelado o expiró");
+      }
+
+      transaction.update(rideRef, {
+        status: "accepted",
+        acceptedBy: driverId,
+        acceptedByName: driverData?.fullName || "Conductor",
+        acceptedByPhone: driverData?.phone || null,
+        acceptedByRating: driverData?.rating || 4.5,
+        acceptedByPlate: driverData?.vehicle?.licensePlate || "",
+        acceptedByVehicle:
+          `${driverData?.vehicle?.brand || ""} ${driverData?.vehicle?.model || ""}`.trim() ||
+          "Vehículo",
+        acceptedByVehicleColor: driverData?.vehicle?.color || "",
+        acceptedAt: new Date(),
+      });
+    });
+
     await updateDoc(doc(db, "drivers", driverId, "rideNotifications", rideId), {
       notificationStatus: "accepted",
       acceptedAt: serverTimestamp(),
     });
 
-    // 2. Actualizar ride
-    await updateDoc(doc(db, "rides", rideId), {
-      status: "accepted",
-      acceptedBy: driverId,
-      acceptedByName: driverData?.fullName,
-      acceptedByPhone: driverData?.phone,
-      acceptedByRating: driverData?.rating,
-      acceptedAt: serverTimestamp(),
-    });
-
+    console.log("✅ Viaje aceptado por:", driverId);
     return { success: true };
-  } catch (error) {
-    console.error("❌ Error aceptando:", error);
-    return { success: false, error: String(error) };
+  } catch (error: any) {
+    console.error("❌ Error aceptando:", error.message || error);
+    return { success: false, error: error.message || String(error) };
   }
 };
 
@@ -153,22 +206,18 @@ export const rejectRideNotification = async (
   rideId: string,
 ): Promise<{ success: boolean; error?: string }> => {
   try {
-    console.log("❌ Rechazando viaje:", rideId);
-
     await updateDoc(doc(db, "drivers", driverId, "rideNotifications", rideId), {
       notificationStatus: "rejected",
       rejectedAt: serverTimestamp(),
     });
-
     return { success: true };
   } catch (error) {
-    console.error("❌ Error rechazando:", error);
     return { success: false, error: String(error) };
   }
 };
 
 /**
- * Expirar notificación (timeout local)
+ * Expirar notificación
  */
 export const expireRideNotification = async (
   driverId: string,
@@ -181,7 +230,6 @@ export const expireRideNotification = async (
     });
     return { success: true };
   } catch (error) {
-    console.error("❌ Error expirando:", error);
     return { success: false, error: String(error) };
   }
 };

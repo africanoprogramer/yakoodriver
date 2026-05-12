@@ -1,12 +1,23 @@
 import { db } from "@/config/firebase";
 import { useAuth } from "@/contexts/AuthContext";
 import { updateDriverEarnings } from "@/utils/earningsService";
-import { formatDistance, watchLocation } from "@/utils/geoLocationService";
+import {
+  formatDistance,
+  isNearPickupLocation,
+  watchLocation,
+} from "@/utils/geoLocationService";
 import { verifyPin } from "@/utils/pickupPinService";
 import { Ionicons } from "@expo/vector-icons";
 import { router, useLocalSearchParams } from "expo-router";
-import { doc, onSnapshot, updateDoc } from "firebase/firestore";
-import React, { useEffect, useState } from "react";
+import {
+  doc,
+  getDoc,
+  onSnapshot,
+  serverTimestamp,
+  setDoc,
+  updateDoc,
+} from "firebase/firestore";
+import React, { useEffect, useRef, useState } from "react";
 import {
   Alert,
   Animated,
@@ -27,25 +38,22 @@ interface Location {
   lat: number;
   lng: number;
 }
-
 interface Passenger {
   userId: string;
   userEmail: string;
   userPhone?: string;
 }
 
-const DEFAULT_LAT = 3.8667;
-const DEFAULT_LNG = 11.5167;
+const DEFAULT_LAT = 3.7504;
+const DEFAULT_LNG = 8.7371;
 
 export default function DriverTripInProgressScreen() {
   const { user } = useAuth();
   const params = useLocalSearchParams();
-
   const [driverCoords, setDriverCoords] = useState<{
     latitude: number;
     longitude: number;
   } | null>(null);
-  // Estados principales
   const [rideId, setRideId] = useState<string>(
     typeof params.rideId === "string" ? params.rideId : "",
   );
@@ -60,49 +68,46 @@ export default function DriverTripInProgressScreen() {
   const [fare, setFare] = useState(1300);
   const [rideCompleted, setRideCompleted] = useState(false);
   const [completingTrip, setCompletingTrip] = useState(false);
-
-  // Estados de geolocalización
   const [driverDistance, setDriverDistance] = useState<number | null>(null);
   const [isNearPickup, setIsNearPickup] = useState(false);
   const [checkingDistance, setCheckingDistance] = useState(false);
-
-  // Estados de PIN
   const [pinInput, setPinInput] = useState("");
   const [pinVerifying, setPinVerifying] = useState(false);
   const [showPinInput, setShowPinInput] = useState(false);
-
-  // Animaciones
   const [pulseAnim] = useState(new Animated.Value(1));
+  const mapRef = useRef<MapView>(null);
+  const [driverProfile, setDriverProfile] = useState<{
+    fullName?: string;
+    phone?: string;
+  } | null>(null);
 
-  // Parsear parámetros
+  // Cargar perfil del conductor desde Firestore
   useEffect(() => {
-    if (!rideId && typeof params.rideId === "string") {
-      setRideId(params.rideId);
-    }
+    if (!user?.uid) return;
+    getDoc(doc(db, "drivers", user.uid))
+      .then((snap) => {
+        if (snap.exists()) {
+          const data = snap.data();
+          setDriverProfile({ fullName: data.fullName, phone: data.phone });
+        }
+      })
+      .catch(() => {});
+  }, [user?.uid]);
 
-    if (params.pickup && typeof params.pickup === "string") {
+  useEffect(() => {
+    if (!rideId && typeof params.rideId === "string") setRideId(params.rideId);
+    if (params.pickup && typeof params.pickup === "string")
       try {
         setPickup(JSON.parse(params.pickup));
-      } catch (e) {
-        console.error("Error parsing pickup:", e);
-      }
-    }
-
-    if (params.destination && typeof params.destination === "string") {
+      } catch {}
+    if (params.destination && typeof params.destination === "string")
       try {
         setDestination(JSON.parse(params.destination));
-      } catch (e) {
-        console.error("Error parsing destination:", e);
-      }
-    }
-
-    if (params.distance && typeof params.distance === "string") {
+      } catch {}
+    if (params.distance && typeof params.distance === "string")
       setDistance(parseFloat(params.distance));
-    }
-
-    if (params.fare && typeof params.fare === "string") {
+    if (params.fare && typeof params.fare === "string")
       setFare(parseFloat(params.fare));
-    }
   }, [
     params.rideId,
     params.pickup,
@@ -111,46 +116,41 @@ export default function DriverTripInProgressScreen() {
     params.fare,
   ]);
 
-  // Escuchar cambios en el ride
   useEffect(() => {
     if (!rideId) return;
-
-    const rideRef = doc(db, "rides", rideId);
     let isMounted = true;
-
-    const unsubscribe = onSnapshot(rideRef, (snapshot) => {
+    const unsub = onSnapshot(doc(db, "rides", rideId), (snap) => {
       if (!isMounted) return;
-      const data = snapshot.data();
-      if (data) {
-        console.log("📊 Ride status:", data.status);
-
-        // Detectar cancelación del pasajero PRIMERO
-        if (data.status === "cancelled" && data.cancelledBy === "passenger") {
-          Alert.alert(
-            "Viaje cancelado",
-            `El pasajero canceló el viaje.\nMotivo: ${data.cancelReason || "Sin motivo"}`,
-            [{ text: "OK", onPress: () => router.replace("/(tabs)") }],
-          );
-          return; // ← No seguir procesando
-        }
-
-        const mapped = data.status === "accepted" ? "arriving" : data.status;
-        setTripStatus(mapped || "arriving");
-
-        if (data.distance) setDistance(data.distance);
-        if (data.estimatedPrice) setFare(data.estimatedPrice);
+      const data = snap.data();
+      if (!data) return;
+      if (data.status === "cancelled" && data.cancelledBy === "passenger") {
+        Alert.alert(
+          "Viaje cancelado",
+          `Pasajero canceló.\nMotivo: ${data.cancelReason || "Sin motivo"}`,
+          [{ text: "OK", onPress: () => router.replace("/(tabs)") }],
+        );
+        return;
       }
+      setTripStatus(
+        data.status === "accepted" ? "arriving" : data.status || "arriving",
+      );
+      if (data.distance) setDistance(data.distance);
+      if (data.estimatedPrice) setFare(data.estimatedPrice);
+      if (data.userId && !passenger)
+        setPassenger({
+          userId: data.userId,
+          userEmail: data.userEmail || "",
+          userPhone: data.userPhone || "",
+        });
     });
-
     return () => {
       isMounted = false;
-      unsubscribe();
+      unsub();
     };
   }, [rideId]);
 
-  // Animación de pulso
   useEffect(() => {
-    const animation = Animated.loop(
+    const a = Animated.loop(
       Animated.sequence([
         Animated.timing(pulseAnim, {
           toValue: 1.1,
@@ -164,303 +164,306 @@ export default function DriverTripInProgressScreen() {
         }),
       ]),
     );
+    a.start();
+    return () => a.stop();
+  }, []);
 
-    animation.start();
-    return () => animation.stop();
-  }, [pulseAnim]);
-
-  // Publicar ubicación del conductor en Firestore en tiempo real
   useEffect(() => {
     if (!rideId || tripStatus === "completed") return;
-
-    console.log("📡 Iniciando publicación de ubicación...");
-
-    const stopWatching = watchLocation(
-      async (coords) => {
-        setDriverCoords(coords);
+    console.log("📡 Iniciando GPS real para publicar ubicación...");
+    const stop = watchLocation(
+      async (c) => {
+        setDriverCoords(c);
+        console.log(
+          "📍 Publicando ubicación:",
+          c.latitude.toFixed(4),
+          c.longitude.toFixed(4),
+        );
         try {
           await updateDoc(doc(db, "rides", rideId), {
             driverLocation: {
-              lat: coords.latitude,
-              lng: coords.longitude,
+              lat: c.latitude,
+              lng: c.longitude,
               updatedAt: new Date(),
             },
           });
-        } catch (error) {
-          console.error("Error actualizando ubicación:", error);
+        } catch (e) {
+          console.error("❌ Error publicando ubicación:", e);
         }
       },
-      (error) => console.error("Error GPS:", error),
+      (err) => {
+        console.error("❌ GPS error:", err);
+      },
     );
-
-    return () => stopWatching();
+    return () => stop();
   }, [rideId, tripStatus]);
 
   const handleCallPassenger = () => {
-    if (passenger?.userPhone) {
-      Linking.openURL(`tel:${passenger.userPhone}`);
-    }
+    if (passenger?.userPhone) Linking.openURL(`tel:${passenger.userPhone}`);
   };
-
   const handleMessagePassenger = () => {
-    if (passenger?.userPhone) {
-      Linking.openURL(`sms:${passenger.userPhone}`);
-    }
+    if (passenger?.userPhone) Linking.openURL(`sms:${passenger.userPhone}`);
   };
 
-  /**
-   * PASO 1: Verificar Geolocalización
-   */
   const handleCheckDistance = async () => {
-    try {
-      if (!pickup) return;
-
-      setCheckingDistance(true);
-      console.log("📍 Verificando distancia...");
-
-      // 🔧 PARA TESTING: Simular que el conductor está cerca
-      const mockDistance = 50; // 50 metros
-
-      setCheckingDistance(false);
-      setDriverDistance(mockDistance);
-
-      if (mockDistance > 100) {
-        Alert.alert(
-          "Muy lejos",
-          `Estás a ${formatDistance(mockDistance)} de distancia.\n\nDebe ser menos de 100 metros.`,
-          [{ text: "OK" }],
-        );
-        setIsNearPickup(false);
-        return;
-      }
-
-      // Está cerca - mostrar PIN input
-      setIsNearPickup(true);
-      setShowPinInput(true);
+    if (!pickup) return;
+    setCheckingDistance(true);
+    const result = await isNearPickupLocation(
+      { latitude: pickup.lat, longitude: pickup.lng },
+      100,
+    );
+    setCheckingDistance(false);
+    setDriverDistance(result.distance);
+    if (!result.isNear) {
       Alert.alert(
-        "✅ Estás lo suficientemente cerca",
-        "Ahora ingresa el código PIN del pasajero",
-        [{ text: "OK" }],
+        "Muy lejos",
+        `Estás a ${formatDistance(result.distance)}. Debes estar a menos de 100m.`,
       );
-    } catch (error) {
-      console.error("Error:", error);
-      setCheckingDistance(false);
-      Alert.alert("Error", "No se pudo verificar la distancia");
+      setIsNearPickup(false);
+      return;
     }
+    setIsNearPickup(true);
+    setShowPinInput(true);
+    Alert.alert("✅ Cerca", "Ingresa el PIN del pasajero");
   };
 
-  /**
-   * PASO 2: Verificar PIN
-   */
   const handleVerifyPin = async () => {
-    try {
-      if (!pinInput || pinInput.length !== 4) {
-        Alert.alert("Error", "El código debe tener 4 dígitos");
-        return;
-      }
-
-      if (!rideId || !user) return;
-
-      setPinVerifying(true);
-      console.log("🔐 Verificando PIN...");
-
-      const isValid = await verifyPin(rideId, pinInput);
-
-      setPinVerifying(false);
-
-      if (!isValid) {
-        Alert.alert("Error", "Código incorrecto o expirado");
-        return;
-      }
-
-      // PIN VERIFICADO - Confirmar recogida
-      console.log("✅ PIN verificado - Confirmando recogida");
-
-      await updateDoc(doc(db, "rides", rideId), {
-        status: "in_progress",
-        arrivedAt: new Date(),
-        pickupVerifiedWith: "geolocation_pin",
-        pickupVerifiedAt: new Date(),
-      });
-
-      setTripStatus("in_progress");
-      setPinInput("");
-      setShowPinInput(false);
-
-      Alert.alert("✅", "Recogida confirmada con éxito");
-    } catch (error) {
-      console.error("Error:", error);
-      setPinVerifying(false);
-      Alert.alert("Error", "Hubo un error verificando el PIN");
+    if (!pinInput || pinInput.length !== 4) {
+      Alert.alert("Error", "4 dígitos");
+      return;
     }
+    if (!rideId || !user) return;
+    setPinVerifying(true);
+    const ok = await verifyPin(rideId, pinInput);
+    setPinVerifying(false);
+    if (!ok) {
+      Alert.alert("Error", "PIN incorrecto o expirado");
+      return;
+    }
+    await updateDoc(doc(db, "rides", rideId), {
+      status: "in_progress",
+      arrivedAt: new Date(),
+      pickupVerifiedWith: "geolocation_pin",
+      pickupVerifiedAt: new Date(),
+    });
+    setTripStatus("in_progress");
+    setPinInput("");
+    setShowPinInput(false);
+    Alert.alert("✅", "Recogida confirmada");
   };
 
-  const handleCompleteTrip = async () => {
-    try {
-      if (!rideId || !user) return;
-
-      Alert.alert("¿Completar viaje?", "¿Has llegado al destino?", [
-        { text: "No" },
-        {
-          text: "Sí, completado",
-          onPress: async () => {
-            setCompletingTrip(true);
-
-            const commission = Math.round(fare * 0.1); // 10% Yakoo
-            const driverEarnings = fare - commission; // 90% conductor
-
-            // 1. Actualizar el ride con desglose financiero
-            await updateDoc(doc(db, "rides", rideId), {
-              status: "completed",
-              completedAt: new Date(),
-              fare: fare,
-              commission: commission,
-              driverEarnings: driverEarnings,
-              paymentMethod: "cash",
-            });
-
-            // 2. Actualizar ganancias y descontar comisión del balance del conductor
-            const earningsResult = await updateDriverEarnings(
-              user.uid,
-              driverEarnings, // ← solo el 90%, no el 100%
-              rideId,
-              commission, // ← pasa la comisión para descontarla del balance
-            );
-
-            setCompletingTrip(false);
-
-            if (earningsResult.success) {
-              setTripStatus("completed");
-              setRideCompleted(true);
-
-              Alert.alert(
-                "¡Viaje Completado! 🎉",
-                `Tarifa cobrada: ${fare.toLocaleString("es-GQ")} XAF\n` +
-                  `Comisión Yakoo (10%): -${commission.toLocaleString("es-GQ")} XAF\n` +
-                  `──────────────────\n` +
-                  `Tu ganancia: ${driverEarnings.toLocaleString("es-GQ")} XAF`,
-                [
-                  {
-                    text: "OK",
-                    onPress: () => {
-                      setTimeout(() => router.back(), 500);
-                    },
-                  },
-                ],
-              );
-            }
-          },
-        },
-      ]);
-    } catch (error) {
-      console.error("Error:", error);
-      setCompletingTrip(false);
-    }
-  };
-
-  const handleCancelTrip = () => {
-    Alert.alert("¿Cancelar viaje?", "¿Estás seguro?", [
+  // ══════════════════════════════════════════════════════════
+  // COMPLETAR VIAJE + ESCRIBIR COMISIÓN EN admin_commissions
+  // ══════════════════════════════════════════════════════════
+  const handleCompleteTrip = () => {
+    if (!rideId || !user) return;
+    Alert.alert("¿Completar viaje?", "¿Has llegado al destino?", [
       { text: "No" },
       {
-        text: "Sí, cancelar",
+        text: "Sí, completado",
         onPress: async () => {
+          setCompletingTrip(true);
+          const commissionRate = 10;
+          const commission = Math.round(fare * (commissionRate / 100));
+          const driverEarnings = fare - commission;
+
+          // 1. Actualizar ride
+          await updateDoc(doc(db, "rides", rideId), {
+            status: "completed",
+            completedAt: new Date(),
+            fare,
+            commission,
+            commissionRate,
+            driverEarnings,
+            paymentMethod: "cash",
+          });
+
+          // 2. Ganancias conductor
+          const result = await updateDriverEarnings(
+            user.uid,
+            driverEarnings,
+            rideId,
+            commission,
+          );
+
+          // 3. ── COMISIÓN PARA ADMIN ──
           try {
-            if (!rideId) return;
-
-            await updateDoc(doc(db, "rides", rideId), {
-              status: "cancelled",
-              cancelledAt: new Date(),
-              cancelledBy: "driver",
+            await setDoc(doc(db, "admin_commissions", `uber_${rideId}`), {
+              restaurantId: "yakoo_uber",
+              restaurantName: "Yakoo Uber (Viajes)",
+              orderId: rideId,
+              source: "uber",
+              orderTotal: fare,
+              commissionRate,
+              commissionAmount: commission,
+              restaurantNet: driverEarnings,
+              driverId: user.uid,
+              driverName:
+                driverProfile?.fullName || user.displayName || "Conductor",
+              passengerId: passenger?.userId || null,
+              passengerEmail: passenger?.userEmail || null,
+              pickup: pickup
+                ? { name: pickup.name, address: pickup.address }
+                : null,
+              destination: destination
+                ? { name: destination.name, address: destination.address }
+                : null,
+              distance,
+              paymentMethod: "cash",
+              createdAt: serverTimestamp(),
             });
-
-            Alert.alert("Cancelado", "Pasajero notificado", [
-              { text: "OK", onPress: () => router.back() },
-            ]);
-          } catch (error) {
-            console.error("Error:", error);
+            console.log("✅ Comisión registrada en admin_commissions");
+          } catch (e) {
+            console.error("⚠️ Error guardando comisión:", e);
           }
+
+          setCompletingTrip(false);
+          if (result.success) {
+            setTripStatus("completed");
+            setRideCompleted(true);
+            Alert.alert(
+              "¡Viaje Completado! 🎉",
+              `Tarifa: ${fare.toLocaleString("es-GQ")} XAF\nComisión (${commissionRate}%): -${commission.toLocaleString("es-GQ")} XAF\n──────────────\nTu ganancia: ${driverEarnings.toLocaleString("es-GQ")} XAF`,
+              [
+                {
+                  text: "OK",
+                  onPress: () =>
+                    setTimeout(() => router.replace("/(tabs)"), 500),
+                },
+              ],
+            );
+          } else Alert.alert("Error", "No se pudo registrar ganancias");
         },
-        style: "destructive",
       },
     ]);
   };
 
-  if (!rideId || !pickup || !destination) {
+  const handleCancelTrip = () => {
+    Alert.alert("¿Cancelar?", "¿Estás seguro?", [
+      { text: "No" },
+      {
+        text: "Sí",
+        style: "destructive",
+        onPress: async () => {
+          if (!rideId) return;
+          await updateDoc(doc(db, "rides", rideId), {
+            status: "cancelled",
+            cancelledAt: new Date(),
+            cancelledBy: "driver",
+          });
+          Alert.alert("Cancelado", "Pasajero notificado", [
+            { text: "OK", onPress: () => router.replace("/(tabs)") },
+          ]);
+        },
+      },
+    ]);
+  };
+
+  // Centrar mapa en todos los puntos
+  useEffect(() => {
+    if (!pickup || !destination) return;
+    const timer = setTimeout(() => {
+      const coords = [
+        { latitude: pickup.lat, longitude: pickup.lng },
+        { latitude: destination.lat, longitude: destination.lng },
+      ];
+      if (driverCoords) {
+        coords.push({
+          latitude: driverCoords.latitude,
+          longitude: driverCoords.longitude,
+        });
+      }
+      mapRef.current?.fitToCoordinates(coords, {
+        edgePadding: { top: 100, right: 60, bottom: 320, left: 60 },
+        animated: true,
+      });
+    }, 600);
+    return () => clearTimeout(timer);
+  }, [pickup, destination, driverCoords]);
+
+  if (!rideId || !pickup || !destination)
     return (
-      <SafeAreaView style={styles.container}>
-        <View style={styles.loadingContainer}>
-          <Text style={styles.loadingText}>Cargando viaje...</Text>
+      <SafeAreaView style={s.container}>
+        <View style={s.loadingContainer}>
+          <Text style={s.loadingText}>Cargando...</Text>
         </View>
       </SafeAreaView>
     );
-  }
 
-  const pickupLat = pickup.lat;
-  const pickupLng = pickup.lng;
-  const destLat = destination.lat;
-  const destLng = destination.lng;
-  const driverLat = driverCoords?.latitude ?? (pickupLat + destLat) / 2 - 0.005;
-  const driverLng =
-    driverCoords?.longitude ?? (pickupLng + destLng) / 2 - 0.005;
+  const pLat = pickup.lat,
+    pLng = pickup.lng,
+    dLat = destination.lat,
+    dLng = destination.lng;
+  const drLat = driverCoords?.latitude ?? pLat;
+  const drLng = driverCoords?.longitude ?? pLng;
+  const hasDriverCoords = driverCoords !== null;
 
-  const initialRegion = {
-    latitude: (pickupLat + destLat) / 2,
-    longitude: (pickupLng + destLng) / 2,
-    latitudeDelta: 0.1,
-    longitudeDelta: 0.1,
+  const mapRegion = {
+    latitude: (pLat + dLat) / 2,
+    longitude: (pLng + dLng) / 2,
+    latitudeDelta: Math.max(Math.abs(pLat - dLat) * 2.5, 0.05),
+    longitudeDelta: Math.max(Math.abs(pLng - dLng) * 2.5, 0.05),
   };
 
   return (
-    <SafeAreaView style={styles.container} edges={["top"]}>
+    <SafeAreaView style={s.container} edges={["top"]}>
       <MapView
-        style={styles.map}
+        ref={mapRef}
+        style={s.map}
         provider={PROVIDER_GOOGLE}
-        initialRegion={initialRegion}
-        showsUserLocation={true}
-        showsMyLocationButton={true}
+        initialRegion={mapRegion}
       >
+        {/* Línea morada discontinua: conductor → pickup */}
+        {hasDriverCoords && (
+          <Polyline
+            coordinates={[
+              { latitude: drLat, longitude: drLng },
+              { latitude: pLat, longitude: pLng },
+            ]}
+            strokeColor="#9333EA"
+            strokeWidth={4}
+            geodesic
+            lineDashPattern={[10, 8]}
+          />
+        )}
+        {/* Línea naranja sólida: pickup → destino */}
         <Polyline
           coordinates={[
-            { latitude: pickupLat, longitude: pickupLng },
-            { latitude: driverLat, longitude: driverLng },
-            { latitude: destLat, longitude: destLng },
+            { latitude: pLat, longitude: pLng },
+            { latitude: dLat, longitude: dLng },
           ]}
           strokeColor="#FF6B35"
-          strokeWidth={3}
-          geodesic={true}
+          strokeWidth={5}
+          geodesic
         />
-
         <Marker
-          coordinate={{ latitude: pickupLat, longitude: pickupLng }}
+          coordinate={{ latitude: pLat, longitude: pLng }}
           pinColor="#FF6B35"
+          title="Recogida"
         />
-
-        <Animated.View
-          style={[
-            styles.driverMarkerContainer,
-            { transform: [{ scale: pulseAnim }] },
-          ]}
-        >
-          <Marker
-            coordinate={{ latitude: driverLat, longitude: driverLng }}
-            pinColor="#9333EA"
-          />
-        </Animated.View>
-
+        {hasDriverCoords && (
+          <Animated.View
+            style={[s.driverMarker, { transform: [{ scale: pulseAnim }] }]}
+          >
+            <Marker
+              coordinate={{ latitude: drLat, longitude: drLng }}
+              pinColor="#9333EA"
+              title="Tu posición"
+            />
+          </Animated.View>
+        )}
         <Marker
-          coordinate={{ latitude: destLat, longitude: destLng }}
+          coordinate={{ latitude: dLat, longitude: dLng }}
           pinColor="#10B981"
+          title="Destino"
         />
       </MapView>
 
       <TouchableOpacity
-        style={styles.backButton}
+        style={s.backBtn}
         onPress={() => {
-          if (!rideCompleted) {
-            handleCancelTrip();
-          } else {
-            router.back();
-          }
+          if (!rideCompleted) handleCancelTrip();
+          else router.replace("/(tabs)");
         }}
       >
         <Ionicons name="chevron-back" size={24} color="#fff" />
@@ -468,49 +471,46 @@ export default function DriverTripInProgressScreen() {
 
       <View
         style={[
-          styles.bottomSheet,
-          expanded && styles.bottomSheetExpanded,
-          tripStatus === "arriving" &&
-            showPinInput &&
-            styles.bottomSheetWithPin,
+          s.sheet,
+          expanded && s.sheetExp,
+          tripStatus === "arriving" && showPinInput && s.sheetPin,
         ]}
       >
         <TouchableOpacity
-          style={styles.handleContainer}
+          style={s.handleWrap}
           onPress={() => setExpanded(!expanded)}
         >
-          <View style={styles.handle} />
+          <View style={s.handle} />
         </TouchableOpacity>
 
         {!expanded && (
-          <View style={styles.collapsedContent}>
-            <View style={styles.passengerCard}>
-              <View style={styles.passengerAvatarContainer}>
+          <View style={s.collapsed}>
+            <View style={s.pCard}>
+              <View style={s.pAvatar}>
                 <Ionicons name="person" size={24} color="#fff" />
               </View>
-
-              <View style={styles.passengerInfoLeft}>
-                <Text style={styles.passengerName}>Pasajero</Text>
-                <View style={styles.ratingContainer}>
+              <View style={{ flex: 1 }}>
+                <Text style={s.pName}>Pasajero</Text>
+                <View
+                  style={{ flexDirection: "row", alignItems: "center", gap: 4 }}
+                >
                   <Ionicons name="star" size={14} color="#FBBF24" />
-                  <Text style={styles.ratingText}>4.8</Text>
+                  <Text style={s.pRating}>4.8</Text>
                 </View>
               </View>
-
-              <View style={styles.distanceContainer}>
-                <Text style={styles.distanceValue}>{distance.toFixed(1)}</Text>
-                <Text style={styles.distanceLabel}>km</Text>
+              <View style={{ alignItems: "center" }}>
+                <Text style={s.distVal}>{distance.toFixed(1)}</Text>
+                <Text style={s.distLbl}>km</Text>
               </View>
-
-              <View style={styles.actionButtons}>
+              <View style={{ flexDirection: "row", gap: 8 }}>
                 <TouchableOpacity
-                  style={styles.actionButton}
+                  style={s.actBtn}
                   onPress={handleCallPassenger}
                 >
                   <Ionicons name="call" size={20} color="#FF6B35" />
                 </TouchableOpacity>
                 <TouchableOpacity
-                  style={styles.actionButton}
+                  style={s.actBtn}
                   onPress={handleMessagePassenger}
                 >
                   <Ionicons name="chatbubble" size={20} color="#FF6B35" />
@@ -518,32 +518,25 @@ export default function DriverTripInProgressScreen() {
               </View>
             </View>
 
-            {/* 📍 DISTANCIA EN TIEMPO REAL */}
             {tripStatus === "arriving" && driverDistance !== null && (
               <View
                 style={[
-                  styles.distanceAlert,
-                  {
-                    backgroundColor: isNearPickup ? "#D1FAE5" : "#FEF3C7",
-                  },
+                  s.distAlert,
+                  { backgroundColor: isNearPickup ? "#D1FAE5" : "#FEF3C7" },
                 ]}
               >
                 <Text
                   style={[
-                    styles.distanceAlertText,
-                    {
-                      color: isNearPickup ? "#065F46" : "#92400E",
-                    },
+                    s.distAlertTxt,
+                    { color: isNearPickup ? "#065F46" : "#92400E" },
                   ]}
                 >
-                  {isNearPickup ? "🟢 Estoy muy cerca" : "🟡 Casi llego"}
+                  {isNearPickup ? "🟢 Muy cerca" : "🟡 Casi llego"}
                 </Text>
                 <Text
                   style={[
-                    styles.distanceAlertValue,
-                    {
-                      color: isNearPickup ? "#10B981" : "#FF6B35",
-                    },
+                    s.distAlertVal,
+                    { color: isNearPickup ? "#10B981" : "#FF6B35" },
                   ]}
                 >
                   {formatDistance(driverDistance)}
@@ -551,10 +544,10 @@ export default function DriverTripInProgressScreen() {
               </View>
             )}
 
-            <View style={styles.statusBadgeContainer}>
+            <View style={s.badgeWrap}>
               <View
                 style={[
-                  styles.statusBadge,
+                  s.badge,
                   {
                     backgroundColor:
                       tripStatus === "arriving"
@@ -567,7 +560,7 @@ export default function DriverTripInProgressScreen() {
               >
                 <Text
                   style={[
-                    styles.statusBadgeText,
+                    s.badgeTxt,
                     {
                       color:
                         tripStatus === "arriving"
@@ -581,20 +574,17 @@ export default function DriverTripInProgressScreen() {
                   {tripStatus === "arriving" || tripStatus === "accepted"
                     ? "🚗 En camino al pasajero"
                     : tripStatus === "in_progress"
-                      ? "📍 Viajando con pasajero"
-                      : "✅ Viaje completado"}
+                      ? "📍 Viajando"
+                      : "✅ Completado"}
                 </Text>
               </View>
             </View>
 
-            {/* 🔐 PIN INPUT EN COLLAPSED */}
             {tripStatus === "arriving" && showPinInput && (
-              <View style={styles.pinInputContainer}>
-                <Text style={styles.pinInputLabel}>
-                  Ingresa el código del pasajero:
-                </Text>
+              <View style={s.pinBox}>
+                <Text style={s.pinLabel}>Código del pasajero:</Text>
                 <TextInput
-                  style={styles.pinInput}
+                  style={s.pinInput}
                   placeholder="0000"
                   value={pinInput}
                   onChangeText={setPinInput}
@@ -604,36 +594,27 @@ export default function DriverTripInProgressScreen() {
                 />
                 <TouchableOpacity
                   style={[
-                    styles.pinVerifyButton,
-                    (pinVerifying || pinInput.length !== 4) &&
-                      styles.pinVerifyButtonDisabled,
+                    s.pinBtn,
+                    (pinVerifying || pinInput.length !== 4) && s.disabled,
                   ]}
                   onPress={handleVerifyPin}
                   disabled={pinVerifying || pinInput.length !== 4}
                 >
-                  <Text style={styles.pinVerifyText}>
+                  <Text style={s.pinBtnTxt}>
                     {pinVerifying ? "Verificando..." : "Verificar"}
                   </Text>
                 </TouchableOpacity>
               </View>
             )}
 
-            {/* BOTÓN PRINCIPAL */}
             {tripStatus === "arriving" && (
               <TouchableOpacity
-                style={[
-                  styles.actionButtonPrimary,
-                  checkingDistance && styles.actionButtonDisabled,
-                ]}
+                style={[s.primaryBtn, checkingDistance && s.disabled]}
                 onPress={handleCheckDistance}
                 disabled={checkingDistance}
               >
-                {checkingDistance ? (
-                  <Ionicons name="hourglass" size={20} color="#fff" />
-                ) : (
-                  <Ionicons name="navigate" size={20} color="#fff" />
-                )}
-                <Text style={styles.actionButtonText}>
+                <Ionicons name="navigate" size={20} color="#fff" />
+                <Text style={s.primaryBtnTxt}>
                   {checkingDistance
                     ? "Verificando..."
                     : isNearPickup
@@ -642,188 +623,92 @@ export default function DriverTripInProgressScreen() {
                 </Text>
               </TouchableOpacity>
             )}
-
             {tripStatus === "in_progress" && (
               <TouchableOpacity
-                style={[
-                  styles.actionButtonPrimary,
-                  completingTrip && styles.actionButtonDisabled,
-                ]}
+                style={[s.primaryBtn, completingTrip && s.disabled]}
                 onPress={handleCompleteTrip}
                 disabled={completingTrip}
               >
                 <Ionicons name="flag" size={20} color="#fff" />
-                <Text style={styles.actionButtonText}>
+                <Text style={s.primaryBtnTxt}>
                   {completingTrip ? "Procesando..." : "Viaje Completado"}
                 </Text>
               </TouchableOpacity>
             )}
-
             {!rideCompleted && (
-              <TouchableOpacity
-                style={styles.cancelButtonCollapsed}
-                onPress={handleCancelTrip}
-              >
+              <TouchableOpacity style={s.cancelBtn} onPress={handleCancelTrip}>
                 <Ionicons name="close" size={16} color="#EF4444" />
-                <Text style={styles.cancelButtonCollapsedText}>Cancelar</Text>
+                <Text style={s.cancelBtnTxt}>Cancelar</Text>
               </TouchableOpacity>
             )}
           </View>
         )}
 
         {expanded && (
-          <ScrollView
-            style={styles.expandedContent}
-            showsVerticalScrollIndicator={false}
-          >
-            {/* Información del pasajero */}
-            <View style={styles.section}>
-              <Text style={styles.sectionTitle}>Pasajero</Text>
-              <View style={styles.passengerDetailCard}>
-                <View style={styles.detailRow}>
-                  <View style={styles.largeAvatar}>
-                    <Ionicons name="person" size={32} color="#fff" />
-                  </View>
-                  <View style={styles.passengerDetails}>
-                    <Text style={styles.detailName}>Pasajero</Text>
-                    <Text style={styles.passengerEmail}>
-                      {passenger?.userEmail}
-                    </Text>
-                    {passenger?.userPhone && (
-                      <Text style={styles.passengerPhone}>
-                        {passenger.userPhone}
-                      </Text>
-                    )}
-                  </View>
-                </View>
-
-                <View style={styles.detailActions}>
-                  <TouchableOpacity
-                    style={styles.detailActionButton}
-                    onPress={handleCallPassenger}
-                  >
-                    <Ionicons name="call" size={22} color="#FF6B35" />
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    style={styles.detailActionButton}
-                    onPress={handleMessagePassenger}
-                  >
-                    <Ionicons name="chatbubble" size={22} color="#FF6B35" />
-                  </TouchableOpacity>
-                </View>
-              </View>
-            </View>
-
-            {/* Ruta */}
-            <View style={styles.section}>
-              <Text style={styles.sectionTitle}>Ruta</Text>
-              <View style={styles.routeInfo}>
-                <View style={styles.routeItem}>
-                  <View style={styles.routeItemIcon}>
+          <ScrollView style={s.expContent} showsVerticalScrollIndicator={false}>
+            <View style={s.section}>
+              <Text style={s.secTitle}>Ruta</Text>
+              <View style={s.routeBox}>
+                <View style={s.routeRow}>
+                  <View style={s.routeIcon}>
                     <Ionicons name="location" size={20} color="#FF6B35" />
                   </View>
-                  <View style={styles.routeItemText}>
-                    <Text style={styles.routeItemLabel}>Recogida</Text>
-                    <Text style={styles.routeItemName}>{pickup.name}</Text>
+                  <View style={{ flex: 1 }}>
+                    <Text style={s.routeLbl}>Recogida</Text>
+                    <Text style={s.routeName}>{pickup.name}</Text>
                   </View>
                 </View>
-
-                <View style={styles.routeLine} />
-
-                <View style={styles.routeItem}>
-                  <View style={styles.routeItemIcon}>
+                <View style={s.routeLine} />
+                <View style={s.routeRow}>
+                  <View style={s.routeIcon}>
                     <Ionicons name="flag" size={20} color="#10B981" />
                   </View>
-                  <View style={styles.routeItemText}>
-                    <Text style={styles.routeItemLabel}>Destino</Text>
-                    <Text style={styles.routeItemName}>{destination.name}</Text>
+                  <View style={{ flex: 1 }}>
+                    <Text style={s.routeLbl}>Destino</Text>
+                    <Text style={s.routeName}>{destination.name}</Text>
                   </View>
                 </View>
               </View>
             </View>
-
-            {/* Detalles */}
-            <View style={styles.section}>
-              <Text style={styles.sectionTitle}>Detalles</Text>
-              <View style={styles.detailsGrid}>
-                <View style={styles.detailItem}>
-                  <View style={styles.detailItemIcon}>
+            <View style={s.section}>
+              <Text style={s.secTitle}>Detalles</Text>
+              <View style={s.detGrid}>
+                <View style={s.detItem}>
+                  <View style={s.detIcon}>
                     <Ionicons name="navigate" size={24} color="#FF6B35" />
                   </View>
-                  <Text style={styles.detailItemLabel}>Distancia</Text>
-                  <Text style={styles.detailItemValue}>
-                    {distance.toFixed(1)} km
-                  </Text>
+                  <Text style={s.detLbl}>Distancia</Text>
+                  <Text style={s.detVal}>{distance.toFixed(1)} km</Text>
                 </View>
-
-                <View style={[styles.detailItem, styles.fareHighlight]}>
-                  <View
-                    style={[styles.detailItemIcon, styles.fareIconHighlight]}
-                  >
+                <View style={[s.detItem, s.fareHL]}>
+                  <View style={[s.detIcon, s.fareIconHL]}>
                     <Ionicons name="cash" size={24} color="#fff" />
                   </View>
-                  <Text style={styles.detailItemLabel}>Tarifa</Text>
-                  <Text
-                    style={[styles.detailItemValue, styles.fareValueHighlight]}
-                  >
+                  <Text style={s.detLbl}>Tarifa</Text>
+                  <Text style={[s.detVal, s.fareValHL]}>
                     {fare.toLocaleString("es-GQ")} XAF
                   </Text>
                 </View>
               </View>
             </View>
-
-            {/* Acciones */}
-            <View style={styles.section}>
-              {tripStatus === "arriving" && (
-                <TouchableOpacity
-                  style={styles.actionButtonPrimary}
-                  onPress={handleCheckDistance}
-                  disabled={checkingDistance}
-                >
-                  <Ionicons name="navigate" size={20} color="#fff" />
-                  <Text style={styles.actionButtonText}>
-                    {checkingDistance ? "Verificando..." : "Acércate"}
-                  </Text>
-                </TouchableOpacity>
-              )}
-
-              {tripStatus === "in_progress" && (
-                <TouchableOpacity
-                  style={[
-                    styles.actionButtonPrimary,
-                    completingTrip && styles.actionButtonDisabled,
-                  ]}
-                  onPress={handleCompleteTrip}
-                  disabled={completingTrip}
-                >
-                  <Ionicons name="flag" size={20} color="#fff" />
-                  <Text style={styles.actionButtonText}>
-                    {completingTrip ? "Procesando..." : "Completar"}
-                  </Text>
-                </TouchableOpacity>
-              )}
-
-              {!rideCompleted && (
-                <TouchableOpacity
-                  style={styles.cancelButton}
-                  onPress={handleCancelTrip}
-                >
-                  <Ionicons name="close" size={20} color="#EF4444" />
-                  <Text style={styles.cancelButtonText}>Cancelar</Text>
-                </TouchableOpacity>
-              )}
-
-              {rideCompleted && (
-                <View style={styles.completedContainer}>
-                  <Ionicons name="checkmark-circle" size={48} color="#10B981" />
-                  <Text style={styles.completedTitle}>¡Completado!</Text>
-                  <Text style={styles.completedEarnings}>
-                    💰 +{fare.toLocaleString("es-GQ")} XAF
-                  </Text>
-                </View>
-              )}
-            </View>
-
+            {rideCompleted && (
+              <View style={s.doneBox}>
+                <Ionicons name="checkmark-circle" size={48} color="#10B981" />
+                <Text style={s.doneTitle}>¡Completado!</Text>
+                <Text style={s.doneEarn}>
+                  💰 +{fare.toLocaleString("es-GQ")} XAF
+                </Text>
+              </View>
+            )}
+            {!rideCompleted && (
+              <TouchableOpacity
+                style={s.cancelBtnBig}
+                onPress={handleCancelTrip}
+              >
+                <Ionicons name="close" size={20} color="#EF4444" />
+                <Text style={s.cancelBtnBigTxt}>Cancelar</Text>
+              </TouchableOpacity>
+            )}
             <View style={{ height: 20 }} />
           </ScrollView>
         )}
@@ -832,28 +717,13 @@ export default function DriverTripInProgressScreen() {
   );
 }
 
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: "#1F2937",
-  },
-  loadingContainer: {
-    flex: 1,
-    justifyContent: "center",
-    alignItems: "center",
-  },
-  loadingText: {
-    fontSize: 16,
-    color: "#6B7280",
-  },
-  map: {
-    flex: 1,
-  },
-  driverMarkerContainer: {
-    justifyContent: "center",
-    alignItems: "center",
-  },
-  backButton: {
+const s = StyleSheet.create({
+  container: { flex: 1, backgroundColor: "#1F2937" },
+  loadingContainer: { flex: 1, justifyContent: "center", alignItems: "center" },
+  loadingText: { fontSize: 16, color: "#6B7280" },
+  map: { flex: 1 },
+  driverMarker: { justifyContent: "center", alignItems: "center" },
+  backBtn: {
     position: "absolute",
     top: 20,
     left: 20,
@@ -870,7 +740,7 @@ const styles = StyleSheet.create({
     elevation: 5,
     zIndex: 100,
   },
-  bottomSheet: {
+  sheet: {
     position: "absolute",
     bottom: 0,
     left: 0,
@@ -885,30 +755,18 @@ const styles = StyleSheet.create({
     shadowRadius: 8,
     elevation: 10,
   },
-  bottomSheetExpanded: {
-    maxHeight: "95%",
-  },
-  handleContainer: {
-    alignItems: "center",
-    paddingVertical: 12,
-  },
-  handle: {
-    width: 40,
-    height: 4,
-    borderRadius: 2,
-    backgroundColor: "#E5E7EB",
-  },
-  collapsedContent: {
-    paddingHorizontal: 20,
-    paddingBottom: 20,
-  },
-  passengerCard: {
+  sheetExp: { maxHeight: "95%" },
+  sheetPin: { maxHeight: "75%", paddingBottom: 20 },
+  handleWrap: { alignItems: "center", paddingVertical: 12 },
+  handle: { width: 40, height: 4, borderRadius: 2, backgroundColor: "#E5E7EB" },
+  collapsed: { paddingHorizontal: 20, paddingBottom: 20 },
+  pCard: {
     flexDirection: "row",
     alignItems: "center",
     marginBottom: 12,
     gap: 12,
   },
-  passengerAvatarContainer: {
+  pAvatar: {
     width: 56,
     height: 56,
     borderRadius: 28,
@@ -916,44 +774,11 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     alignItems: "center",
   },
-  passengerInfoLeft: {
-    flex: 1,
-  },
-  passengerName: {
-    fontSize: 16,
-    fontWeight: "700",
-    color: "#1F2937",
-    marginBottom: 2,
-  },
-  ratingContainer: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 4,
-  },
-  ratingText: {
-    fontSize: 12,
-    color: "#6B7280",
-    fontWeight: "600",
-  },
-  distanceContainer: {
-    alignItems: "center",
-    gap: 2,
-  },
-  distanceValue: {
-    fontSize: 20,
-    fontWeight: "700",
-    color: "#FF6B35",
-  },
-  distanceLabel: {
-    fontSize: 11,
-    color: "#6B7280",
-    fontWeight: "600",
-  },
-  actionButtons: {
-    flexDirection: "row",
-    gap: 8,
-  },
-  actionButton: {
+  pName: { fontSize: 16, fontWeight: "700", color: "#1F2937", marginBottom: 2 },
+  pRating: { fontSize: 12, color: "#6B7280", fontWeight: "600" },
+  distVal: { fontSize: 20, fontWeight: "700", color: "#FF6B35" },
+  distLbl: { fontSize: 11, color: "#6B7280", fontWeight: "600" },
+  actBtn: {
     width: 40,
     height: 40,
     borderRadius: 20,
@@ -961,37 +786,24 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     alignItems: "center",
   },
-  distanceAlert: {
+  distAlert: {
     borderRadius: 12,
     padding: 14,
     marginBottom: 12,
     borderLeftWidth: 4,
     borderLeftColor: "#FF6B35",
   },
-  distanceAlertText: {
-    fontSize: 13,
-    fontWeight: "600",
-    marginBottom: 4,
-  },
-  distanceAlertValue: {
-    fontSize: 24,
-    fontWeight: "700",
-    textAlign: "center",
-  },
-  statusBadgeContainer: {
-    marginBottom: 12,
-  },
-  statusBadge: {
+  distAlertTxt: { fontSize: 13, fontWeight: "600", marginBottom: 4 },
+  distAlertVal: { fontSize: 24, fontWeight: "700", textAlign: "center" },
+  badgeWrap: { marginBottom: 12 },
+  badge: {
     paddingHorizontal: 12,
     paddingVertical: 8,
     borderRadius: 8,
     alignItems: "center",
   },
-  statusBadgeText: {
-    fontSize: 13,
-    fontWeight: "600",
-  },
-  pinInputContainer: {
+  badgeTxt: { fontSize: 13, fontWeight: "600" },
+  pinBox: {
     backgroundColor: "#F9FAFB",
     borderRadius: 12,
     padding: 16,
@@ -999,7 +811,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "#E5E7EB",
   },
-  pinInputLabel: {
+  pinLabel: {
     fontSize: 12,
     fontWeight: "600",
     color: "#1F2937",
@@ -1018,26 +830,16 @@ const styles = StyleSheet.create({
     marginBottom: 10,
     color: "#1F2937",
   },
-  pinVerifyButton: {
+  pinBtn: {
     backgroundColor: "#FF6B35",
     borderRadius: 8,
     paddingVertical: 12,
     justifyContent: "center",
     alignItems: "center",
   },
-  pinVerifyButtonDisabled: {
-    opacity: 0.5,
-  },
-  bottomSheetWithPin: {
-    maxHeight: "75%",
-    paddingBottom: 20, // espacio sobre los tabs
-  },
-  pinVerifyText: {
-    fontSize: 14,
-    fontWeight: "700",
-    color: "#fff",
-  },
-  actionButtonPrimary: {
+  pinBtnTxt: { fontSize: 14, fontWeight: "700", color: "#fff" },
+  disabled: { opacity: 0.5 },
+  primaryBtn: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
@@ -1047,15 +849,8 @@ const styles = StyleSheet.create({
     borderRadius: 10,
     marginBottom: 10,
   },
-  actionButtonDisabled: {
-    opacity: 0.6,
-  },
-  actionButtonText: {
-    fontSize: 14,
-    fontWeight: "700",
-    color: "#fff",
-  },
-  cancelButtonCollapsed: {
+  primaryBtnTxt: { fontSize: 14, fontWeight: "700", color: "#fff" },
+  cancelBtn: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
@@ -1064,83 +859,23 @@ const styles = StyleSheet.create({
     backgroundColor: "#FEE2E2",
     borderRadius: 10,
   },
-  cancelButtonCollapsedText: {
-    fontSize: 13,
-    fontWeight: "600",
-    color: "#EF4444",
-  },
-  expandedContent: {
-    paddingHorizontal: 20,
-    paddingTop: 8,
-  },
-  section: {
-    marginBottom: 24,
-  },
-  sectionTitle: {
+  cancelBtnTxt: { fontSize: 13, fontWeight: "600", color: "#EF4444" },
+  expContent: { paddingHorizontal: 20, paddingTop: 8 },
+  section: { marginBottom: 24 },
+  secTitle: {
     fontSize: 14,
     fontWeight: "700",
     color: "#1F2937",
     marginBottom: 12,
   },
-  passengerDetailCard: {
-    backgroundColor: "#F9FAFB",
-    borderRadius: 12,
-    padding: 16,
-    gap: 12,
-  },
-  detailRow: {
-    flexDirection: "row",
-    gap: 12,
-  },
-  largeAvatar: {
-    width: 64,
-    height: 64,
-    borderRadius: 32,
-    backgroundColor: "#FF6B35",
-    justifyContent: "center",
-    alignItems: "center",
-  },
-  passengerDetails: {
-    flex: 1,
-    justifyContent: "space-between",
-  },
-  detailName: {
-    fontSize: 16,
-    fontWeight: "700",
-    color: "#1F2937",
-  },
-  passengerEmail: {
-    fontSize: 12,
-    color: "#6B7280",
-    marginVertical: 2,
-  },
-  passengerPhone: {
-    fontSize: 12,
-    color: "#9CA3AF",
-  },
-  detailActions: {
-    flexDirection: "row",
-    gap: 10,
-  },
-  detailActionButton: {
-    flex: 1,
-    paddingVertical: 10,
-    backgroundColor: "#FEF3C7",
-    borderRadius: 8,
-    justifyContent: "center",
-    alignItems: "center",
-  },
-  routeInfo: {
+  routeBox: {
     backgroundColor: "#F9FAFB",
     borderRadius: 12,
     padding: 14,
     gap: 8,
   },
-  routeItem: {
-    flexDirection: "row",
-    gap: 10,
-  },
-  routeItemIcon: {
+  routeRow: { flexDirection: "row", gap: 10 },
+  routeIcon: {
     width: 32,
     height: 32,
     borderRadius: 16,
@@ -1148,32 +883,21 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     alignItems: "center",
   },
-  routeItemText: {
-    flex: 1,
-  },
-  routeItemLabel: {
+  routeLbl: {
     fontSize: 10,
     color: "#9CA3AF",
     fontWeight: "600",
     marginBottom: 2,
   },
-  routeItemName: {
-    fontSize: 12,
-    fontWeight: "700",
-    color: "#1F2937",
-  },
+  routeName: { fontSize: 12, fontWeight: "700", color: "#1F2937" },
   routeLine: {
     height: 20,
     width: 2,
     backgroundColor: "#E5E7EB",
     marginLeft: 15,
   },
-  detailsGrid: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    gap: 10,
-  },
-  detailItem: {
+  detGrid: { flexDirection: "row", flexWrap: "wrap", gap: 10 },
+  detItem: {
     width: "48%",
     backgroundColor: "#F9FAFB",
     borderRadius: 10,
@@ -1181,10 +905,8 @@ const styles = StyleSheet.create({
     alignItems: "center",
     gap: 6,
   },
-  fareHighlight: {
-    backgroundColor: "#10B981",
-  },
-  detailItemIcon: {
+  fareHL: { backgroundColor: "#10B981" },
+  detIcon: {
     width: 40,
     height: 40,
     borderRadius: 20,
@@ -1192,23 +914,11 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     alignItems: "center",
   },
-  fareIconHighlight: {
-    backgroundColor: "#059669",
-  },
-  detailItemLabel: {
-    fontSize: 10,
-    color: "#9CA3AF",
-    fontWeight: "600",
-  },
-  detailItemValue: {
-    fontSize: 14,
-    fontWeight: "700",
-    color: "#1F2937",
-  },
-  fareValueHighlight: {
-    color: "#fff",
-  },
-  cancelButton: {
+  fareIconHL: { backgroundColor: "#059669" },
+  detLbl: { fontSize: 10, color: "#9CA3AF", fontWeight: "600" },
+  detVal: { fontSize: 14, fontWeight: "700", color: "#1F2937" },
+  fareValHL: { color: "#fff" },
+  cancelBtnBig: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
@@ -1217,24 +927,8 @@ const styles = StyleSheet.create({
     backgroundColor: "#FEE2E2",
     borderRadius: 10,
   },
-  cancelButtonText: {
-    fontSize: 14,
-    fontWeight: "700",
-    color: "#EF4444",
-  },
-  completedContainer: {
-    alignItems: "center",
-    paddingVertical: 24,
-    gap: 10,
-  },
-  completedTitle: {
-    fontSize: 16,
-    fontWeight: "700",
-    color: "#1F2937",
-  },
-  completedEarnings: {
-    fontSize: 16,
-    fontWeight: "700",
-    color: "#10B981",
-  },
+  cancelBtnBigTxt: { fontSize: 14, fontWeight: "700", color: "#EF4444" },
+  doneBox: { alignItems: "center", paddingVertical: 24, gap: 10 },
+  doneTitle: { fontSize: 16, fontWeight: "700", color: "#1F2937" },
+  doneEarn: { fontSize: 16, fontWeight: "700", color: "#10B981" },
 });

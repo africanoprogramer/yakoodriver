@@ -1,4 +1,5 @@
 // app/(driver)/supermarket-orders.tsx
+import DeliveryTicketModal, { TicketOrder } from "@/components/DeliveryTicketModal";
 import { db } from "@/config/firebase";
 import { useAuth } from "@/contexts/AuthContext";
 import { Ionicons } from "@expo/vector-icons";
@@ -110,6 +111,8 @@ export default function DriverSupermarketOrders() {
   );
   const [selected, setSelected] = useState<Order | null>(null);
   const [loading, setLoading] = useState(true);
+  const [ticketOrder, setTicketOrder] = useState<TicketOrder | null>(null);
+  const [ticketVisible, setTicketVisible] = useState(false);
 
   useEffect(() => {
     if (!user) return;
@@ -173,6 +176,23 @@ export default function DriverSupermarketOrders() {
               deliveredAt: serverTimestamp(),
             });
             setSelected(null);
+
+            // Mostrar ticket
+            setTicketOrder({
+              id: order.id,
+              module: "abaceria",
+              supermarketName: order.supermarketName,
+              userName: order.userName,
+              userPhone: order.userPhone,
+              address: order.userAddress,
+              items: (order.items ?? []).map((i) => ({ name: i.name, qty: i.qty, price: i.price })),
+              total: order.total,
+              paymentMethod: "cash",
+              driverName: user?.displayName ?? "Driver",
+              deliveredAt: new Date(),
+              createdAt: order.createdAt,
+            });
+            setTicketVisible(true);
           },
         },
       ],
@@ -379,6 +399,13 @@ export default function DriverSupermarketOrders() {
           {displayed.map(renderCard)}
         </ScrollView>
       )}
+
+      {/* Delivery ticket */}
+      <DeliveryTicketModal
+        visible={ticketVisible}
+        order={ticketOrder}
+        onClose={() => { setTicketVisible(false); setTicketOrder(null); }}
+      />
 
       {/* ── DETAIL MODAL ──────────────────────────────────────────────────── */}
       <Modal

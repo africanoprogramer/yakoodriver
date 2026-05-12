@@ -6,7 +6,8 @@ import {
   getDocs,
   limit,
   orderBy,
-  query
+  query,
+  where,
 } from "firebase/firestore";
 import React, { useEffect, useState } from "react";
 import {
@@ -58,18 +59,18 @@ export default function ActivityScreen() {
     setLoading(true);
 
     try {
-      // Cargar rides del conductor desde la colección rides
       const ridesRef = collection(db, "rides");
-      const q = query(ridesRef, orderBy("createdAt", "desc"), limit(50));
+      const q = query(
+        ridesRef,
+        where("acceptedBy", "==", user.uid),
+        orderBy("createdAt", "desc"),
+        limit(50),
+      );
       const snapshot = await getDocs(q);
 
-      // Filtrar solo los viajes de este conductor
-      const allRides: RideRecord[] = snapshot.docs
-        .map((doc) => ({ id: doc.id, ...doc.data() }) as RideRecord)
-        .filter(
-          (ride: any) =>
-            ride.acceptedBy === user.uid || ride.driverId === user.uid,
-        );
+      const allRides: RideRecord[] = snapshot.docs.map(
+        (doc) => ({ id: doc.id, ...doc.data() }) as RideRecord,
+      );
 
       setRides(allRides);
 

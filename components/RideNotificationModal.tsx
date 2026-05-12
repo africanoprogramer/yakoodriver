@@ -2,7 +2,6 @@ import { Ionicons } from "@expo/vector-icons";
 import React from "react";
 
 import {
-  Alert,
   Animated,
   Modal,
   ScrollView,
@@ -18,6 +17,7 @@ interface RideNotification {
   userId: string;
   userEmail: string;
   userPhone?: string;
+  userName?: string;
   pickup: {
     name: string;
     address: string;
@@ -33,6 +33,7 @@ interface RideNotification {
   vehicleType: string;
   distance: number;
   estimatedPrice: number;
+  notificationStatus?: "pending" | "accepted" | "rejected" | "expired";
   createdAt: any;
 }
 
@@ -56,45 +57,32 @@ export const RideNotificationModal = ({
 
   React.useEffect(() => {
     if (visible) {
-      // Vibración cuando llega notificación
+      setIsLoading(false); // Reset loading state
       Vibration.vibrate([0, 50, 100, 50]);
-
-      // Animación de entrada
       Animated.spring(scaleAnim, {
         toValue: 1,
         useNativeDriver: true,
       }).start();
     } else {
-      // Reset animación
       scaleAnim.setValue(0);
     }
   }, [visible]);
 
-  const handleAccept = async () => {
-    if (!notification) return;
-
-    try {
-      setIsLoading(true);
-      await onAccept(notification);
-      // Navigation will be handled by the caller after this
-      setIsLoading(false);
-    } catch (error) {
-      setIsLoading(false);
-      Alert.alert("Error", "No se pudo aceptar el viaje");
-    }
+  const handleAccept = () => {
+    if (!notification || isLoading) return;
+    setIsLoading(true);
+    // Fire and forget — el parent cierra el modal inmediatamente
+    onAccept(notification)
+      .catch(() => {})
+      .finally(() => setIsLoading(false));
   };
 
-  const handleReject = async () => {
-    if (!notification) return;
-
-    try {
-      setIsLoading(true);
-      await onReject(notification);
-      setIsLoading(false);
-    } catch (error) {
-      setIsLoading(false);
-      Alert.alert("Error", "No se pudo rechazar el viaje");
-    }
+  const handleReject = () => {
+    if (!notification || isLoading) return;
+    setIsLoading(true);
+    onReject(notification)
+      .catch(() => {})
+      .finally(() => setIsLoading(false));
   };
 
   if (!notification) return null;
@@ -106,9 +94,7 @@ export const RideNotificationModal = ({
       animationType="fade"
       pointerEvents="box-none"
     >
-      {/* Overlay oscuro */}
       <View style={styles.overlay}>
-        {/* Card animado */}
         <Animated.View
           style={[
             styles.container,
@@ -124,7 +110,6 @@ export const RideNotificationModal = ({
             },
           ]}
         >
-          {/* Header con ícono de notificación */}
           <View style={styles.header}>
             <View style={styles.iconContainer}>
               <Ionicons name="car" size={32} color="#fff" />
@@ -132,15 +117,12 @@ export const RideNotificationModal = ({
             <Text style={styles.headerTitle}>🎉 Nueva Solicitud</Text>
           </View>
 
-          {/* Información del viaje */}
           <ScrollView
             style={{ flexShrink: 1 }}
             showsVerticalScrollIndicator={false}
             contentContainerStyle={styles.content}
           >
-            {/* Origen y destino */}
             <View style={styles.routeContainer}>
-              {/* Origen */}
               <View style={styles.routeItem}>
                 <View style={styles.routeDot} />
                 <View style={styles.routeTextContainer}>
@@ -153,11 +135,7 @@ export const RideNotificationModal = ({
                   </Text>
                 </View>
               </View>
-
-              {/* Línea conectora */}
               <View style={styles.routeLine} />
-
-              {/* Destino */}
               <View style={styles.routeItem}>
                 <View style={[styles.routeDot, styles.routeDotDestination]} />
                 <View style={styles.routeTextContainer}>
@@ -171,44 +149,6 @@ export const RideNotificationModal = ({
                 </View>
               </View>
             </View>
-
-            {/* Información del viaje */}
-            <View style={styles.detailsContainer}>
-              {/* Distancia */}
-              <View style={styles.detailItem}>
-                <Ionicons name="navigate" size={20} color="#FF6B35" />
-                <View style={styles.detailTextContainer}>
-                  <Text style={styles.detailLabel}>Distancia</Text>
-                  <Text style={styles.detailValue}>
-                    {notification.distance.toFixed(1)} km
-                  </Text>
-                </View>
-              </View>
-
-              {/* Tipo de vehículo */}
-              <View style={styles.detailItem}>
-                <Ionicons name="car-outline" size={20} color="#FF6B35" />
-                <View style={styles.detailTextContainer}>
-                  <Text style={styles.detailLabel}>Tipo de Viaje</Text>
-                  <Text style={styles.detailValue}>
-                    {notification.vehicleType}
-                  </Text>
-                </View>
-              </View>
-
-              {/* Precio estimado */}
-              <View style={styles.detailItem}>
-                <Ionicons name="cash" size={20} color="#FF6B35" />
-                <View style={styles.detailTextContainer}>
-                  <Text style={styles.detailLabel}>Tarifa Estimada</Text>
-                  <Text style={styles.detailValue}>
-                    {notification.estimatedPrice.toLocaleString("es-GQ")} XAF
-                  </Text>
-                </View>
-              </View>
-            </View>
-
-            {/* Información del usuario */}
             <View style={styles.userInfoContainer}>
               <Text style={styles.userLabel}>Datos del Pasajero</Text>
               <View style={styles.userInfo}>
@@ -216,10 +156,12 @@ export const RideNotificationModal = ({
                   <Ionicons name="person" size={20} color="#fff" />
                 </View>
                 <View style={styles.userTextContainer}>
-                  <Text style={styles.userEmail}>{notification.userEmail}</Text>
+                  <Text style={styles.userEmail}>
+                    {notification.userName || notification.userEmail}
+                  </Text>
                   {notification.userPhone && (
                     <Text style={styles.userPhone}>
-                      {notification.userPhone}
+                      📞 {notification.userPhone}
                     </Text>
                   )}
                 </View>
@@ -227,7 +169,6 @@ export const RideNotificationModal = ({
             </View>
           </ScrollView>
 
-          {/* Action Buttons */}
           <View style={styles.actionContainer}>
             <TouchableOpacity
               style={styles.rejectButton}
@@ -237,7 +178,6 @@ export const RideNotificationModal = ({
               <Ionicons name="close" size={24} color="#EF4444" />
               <Text style={styles.rejectButtonText}>Rechazar</Text>
             </TouchableOpacity>
-
             <TouchableOpacity
               style={styles.acceptButton}
               onPress={handleAccept}
@@ -272,8 +212,8 @@ const styles = StyleSheet.create({
     borderTopRightRadius: 24,
     marginHorizontal: 12,
     overflow: "hidden",
-    maxHeight: "90%", // ← sube un poco
-    flexShrink: 1, // ← agrega esto
+    maxHeight: "90%",
+    flexShrink: 1,
   },
   header: {
     backgroundColor: "#FF6B35",
@@ -290,22 +230,10 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     alignItems: "center",
   },
-  headerTitle: {
-    fontSize: 24,
-    fontWeight: "700",
-    color: "#fff",
-  },
-  content: {
-    padding: 20,
-  },
-  routeContainer: {
-    marginBottom: 24,
-  },
-  routeItem: {
-    flexDirection: "row",
-    gap: 12,
-    marginBottom: 16,
-  },
+  headerTitle: { fontSize: 24, fontWeight: "700", color: "#fff" },
+  content: { padding: 20 },
+  routeContainer: { marginBottom: 24 },
+  routeItem: { flexDirection: "row", gap: 12, marginBottom: 16 },
   routeDot: {
     width: 12,
     height: 12,
@@ -313,12 +241,8 @@ const styles = StyleSheet.create({
     backgroundColor: "#FF6B35",
     marginTop: 4,
   },
-  routeDotDestination: {
-    backgroundColor: "#10B981",
-  },
-  routeTextContainer: {
-    flex: 1,
-  },
+  routeDotDestination: { backgroundColor: "#10B981" },
+  routeTextContainer: { flex: 1 },
   routeLabel: {
     fontSize: 11,
     fontWeight: "600",
@@ -331,10 +255,7 @@ const styles = StyleSheet.create({
     color: "#1f2937",
     marginBottom: 2,
   },
-  routeAddress: {
-    fontSize: 12,
-    color: "#6B7280",
-  },
+  routeAddress: { fontSize: 12, color: "#6B7280" },
   routeLine: {
     width: 2,
     height: 30,
@@ -349,28 +270,16 @@ const styles = StyleSheet.create({
     marginBottom: 20,
     gap: 12,
   },
-  detailItem: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 12,
-  },
-  detailTextContainer: {
-    flex: 1,
-  },
+  detailItem: { flexDirection: "row", alignItems: "center", gap: 12 },
+  detailTextContainer: { flex: 1 },
   detailLabel: {
     fontSize: 11,
     fontWeight: "600",
     color: "#9CA3AF",
     marginBottom: 2,
   },
-  detailValue: {
-    fontSize: 14,
-    fontWeight: "700",
-    color: "#1f2937",
-  },
-  userInfoContainer: {
-    marginBottom: 20,
-  },
+  detailValue: { fontSize: 14, fontWeight: "700", color: "#1f2937" },
+  userInfoContainer: { marginBottom: 20 },
   userLabel: {
     fontSize: 12,
     fontWeight: "700",
@@ -394,19 +303,14 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     alignItems: "center",
   },
-  userTextContainer: {
-    flex: 1,
-  },
+  userTextContainer: { flex: 1 },
   userEmail: {
     fontSize: 14,
     fontWeight: "600",
     color: "#1f2937",
     marginBottom: 2,
   },
-  userPhone: {
-    fontSize: 12,
-    color: "#6B7280",
-  },
+  userPhone: { fontSize: 12, color: "#6B7280" },
   actionContainer: {
     flexDirection: "row",
     gap: 12,
@@ -425,11 +329,7 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     gap: 8,
   },
-  rejectButtonText: {
-    fontSize: 14,
-    fontWeight: "700",
-    color: "#EF4444",
-  },
+  rejectButtonText: { fontSize: 14, fontWeight: "700", color: "#EF4444" },
   acceptButton: {
     flex: 1,
     flexDirection: "row",
@@ -440,9 +340,5 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     gap: 8,
   },
-  acceptButtonText: {
-    fontSize: 14,
-    fontWeight: "700",
-    color: "#fff",
-  },
+  acceptButtonText: { fontSize: 14, fontWeight: "700", color: "#fff" },
 });
